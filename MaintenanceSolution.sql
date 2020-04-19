@@ -28,6 +28,8 @@ DECLARE @BackupDirectory nvarchar(max)     = NULL        -- Specify the backup r
 DECLARE @CleanupTime int                   = NULL        -- Time in hours, after which backup files are deleted. If no time is specified, then no backup files are deleted.
 DECLARE @OutputFileDirectory nvarchar(max) = NULL        -- Specify the output file directory. If no directory is specified, then the SQL Server error log directory is used.
 DECLARE @LogToTable nvarchar(max)          = 'Y'         -- Log commands to a table.
+DECLARE @CreateSchedules nvarchar(max)     = 'Y'         -- Specify whether job schedules should be created. Has no effect if CreateJobs is disabled.
+DECLARE @OperatorEmail nvarchar(max)      = 'dba@example.com'
 
 DECLARE @ErrorMessage nvarchar(max)
 
@@ -54,6 +56,9 @@ INSERT INTO #Config ([Name], [Value]) VALUES('CleanupTime', @CleanupTime)
 INSERT INTO #Config ([Name], [Value]) VALUES('OutputFileDirectory', @OutputFileDirectory)
 INSERT INTO #Config ([Name], [Value]) VALUES('LogToTable', @LogToTable)
 INSERT INTO #Config ([Name], [Value]) VALUES('DatabaseName', DB_NAME(DB_ID()))
+INSERT INTO #Config ([Name], [Value]) VALUES('CreateSchedules', @CreateSchedules)
+INSERT INTO #Config ([Name], [Value]) VALUES('OperatorEmail', @OperatorEmail)
+
 GO
 SET ANSI_NULLS ON
 GO
@@ -8662,6 +8667,7 @@ BEGIN
 END
 
 GO
+
 IF (SELECT [Value] FROM #Config WHERE Name = 'CreateJobs') = 'Y' AND SERVERPROPERTY('EngineEdition') NOT IN(4, 5) AND (IS_SRVROLEMEMBER('sysadmin') = 1 OR (DB_ID('rdsadmin') IS NOT NULL AND SUSER_SNAME(0x01) = 'rdsa')) AND (SELECT [compatibility_level] FROM sys.databases WHERE database_id = DB_ID()) >= 90
 BEGIN
 
@@ -8688,6 +8694,8 @@ BEGIN
   DECLARE @JobCategory nvarchar(max)
   DECLARE @JobOwner nvarchar(max)
 
+  declare @OperatorEmail nvarchar(max);
+
   DECLARE @Jobs TABLE (JobID int IDENTITY,
                        [Name] nvarchar(max),
                        CommandTSQL nvarchar(max),
@@ -8696,7 +8704,14 @@ BEGIN
                        OutputFileNamePart01 nvarchar(max),
                        OutputFileNamePart02 nvarchar(max),
                        Selected bit DEFAULT 0,
-                       Completed bit DEFAULT 0)
+                       Completed bit DEFAULT 0,
+                       schedule_name sysname,
+                       schedule_freq_type int,
+                       schedule_freq_interval int,
+                       schedule_freq_subday_type int,
+                       schedule_freq_subday_interval int,
+                       schedule_freq_recurrence_factor int,
+                       schedule_active_start_time int)
 
   DECLARE @CurrentJobID int
   DECLARE @CurrentJobName nvarchar(max)
@@ -8710,6 +8725,14 @@ BEGIN
   DECLARE @CurrentJobStepSubSystem nvarchar(max)
   DECLARE @CurrentJobStepDatabaseName nvarchar(max)
   DECLARE @CurrentOutputFileName nvarchar(max)
+
+  declare @current_schedule_name sysname;
+  declare @current_schedule_freq_type int;
+  declare @current_schedule_freq_interval int;
+  declare @current_schedule_freq_subday_type int;
+  declare @current_schedule_freq_subday_interval int;
+  declare @current_schedule_freq_recurrence_factor int;
+  declare @current_schedule_active_start_time int;
 
   DECLARE @Version numeric(18,10) = CAST(LEFT(CAST(SERVERPROPERTY('ProductVersion') AS nvarchar(max)),CHARINDEX('.',CAST(SERVERPROPERTY('ProductVersion') AS nvarchar(max))) - 1) + '.' + REPLACE(RIGHT(CAST(SERVERPROPERTY('ProductVersion') AS nvarchar(max)), LEN(CAST(SERVERPROPERTY('ProductVersion') AS nvarchar(max))) - CHARINDEX('.',CAST(SERVERPROPERTY('ProductVersion') AS nvarchar(max)))),'.','') AS numeric(18,10))
 
@@ -8798,74 +8821,111 @@ BEGIN
     SET @JobOwner = SUSER_SNAME(0x01)
   END
 
-  INSERT INTO @Jobs ([Name], CommandTSQL, DatabaseName, OutputFileNamePart01, OutputFileNamePart02)
+  select @OperatorEmail = Value
+  from #Config
+  where [Name] = 'OperatorEmail'
+
+  IF @OperatorEmail IS NOT NULL and NOT EXISTS (SELECT 1 FROM msdb.dbo.sysoperators where [name] = @OperatorEmail)
+  BEGIN
+  EXECUTE msdb.dbo.sp_add_operator @name = @OperatorEmail, @enabled = 1, @email_address = @OperatorEmail
+  END
+
+  -- randomize start times for big jobs to reduce load on shared infrastructure
+  declare @full_hour int = round(rand()*3, 0, 1);
+  declare @full_minute int = round(rand()*60, 0, 1);
+  declare @diff_minute int = (@full_minute + 30) % 60;
+  declare @log_minute int = (@full_minute + 5) % 10;
+  declare @check_hour int = @full_hour + 2;
+  declare @index_hour int = @check_hour + 2;
+  declare @sys_hour int = (@full_hour - 1 + 24) % 24;
+  declare @cleanup_hour int = (@sys_hour - 1 + 24) % 24;
+  declare @full_time varchar(4) = right('00' + convert(varchar, @full_hour), 2) + right('00' + convert(varchar, @full_minute), 2);
+  declare @diff_time varchar(4) = '00' + right('00' + convert(varchar, @diff_minute), 2);
+  declare @log_time varchar(4) = '00' + right('00' + convert(varchar, @log_minute), 2);
+  declare @check_time varchar(4) = right('00' + convert(varchar, @check_hour), 2) + right('00' + convert(varchar, @full_minute), 2);
+  declare @index_time varchar(4) = right('00' + convert(varchar, @index_hour), 2) + right('00' + convert(varchar, @full_minute), 2);
+  declare @sys_time varchar(4) = right('00' + convert(varchar, @sys_hour), 2) + right('00' + convert(varchar, @full_minute), 2);
+  declare @cleanup_time varchar(4) = right('00' + convert(varchar, @cleanup_hour), 2) + right('00' + convert(varchar, @full_minute), 2);
+
+  INSERT INTO @Jobs ([Name], CommandTSQL, DatabaseName, OutputFileNamePart01, OutputFileNamePart02, schedule_name, schedule_freq_type, schedule_freq_interval, schedule_freq_subday_type, schedule_freq_subday_interval, schedule_freq_recurrence_factor, schedule_active_start_time)
   SELECT 'DatabaseBackup - SYSTEM_DATABASES - FULL',
          'EXECUTE [dbo].[DatabaseBackup]' + CHAR(13) + CHAR(10) + '@Databases = ''SYSTEM_DATABASES'',' + CHAR(13) + CHAR(10) + '@Directory = ' + ISNULL('N''' + REPLACE(@BackupDirectory,'''','''''') + '''','NULL') + ',' + CHAR(13) + CHAR(10) + '@BackupType = ''FULL'',' + CHAR(13) + CHAR(10) + '@Verify = ''Y'',' + CHAR(13) + CHAR(10) + '@CleanupTime = ' + ISNULL(CAST(@CleanupTime AS nvarchar),'NULL') + ',' + CHAR(13) + CHAR(10) + '@CheckSum = ''Y'',' + CHAR(13) + CHAR(10) + '@LogToTable = ''' + @LogToTable + '''',
          @DatabaseName,
          'DatabaseBackup',
-         'FULL'
+         'FULL',
+         'Every day at ' + @sys_time, 4, 1, 1, 0, 0, @sys_time + '00'
 
-  INSERT INTO @Jobs ([Name], CommandTSQL, DatabaseName, OutputFileNamePart01, OutputFileNamePart02)
+  INSERT INTO @Jobs ([Name], CommandTSQL, DatabaseName, OutputFileNamePart01, OutputFileNamePart02, schedule_name, schedule_freq_type, schedule_freq_interval, schedule_freq_subday_type, schedule_freq_subday_interval, schedule_freq_recurrence_factor, schedule_active_start_time)
   SELECT 'DatabaseBackup - USER_DATABASES - DIFF',
          'EXECUTE [dbo].[DatabaseBackup]' + CHAR(13) + CHAR(10) + '@Databases = ''USER_DATABASES'',' + CHAR(13) + CHAR(10) + '@Directory = ' + ISNULL('N''' + REPLACE(@BackupDirectory,'''','''''') + '''','NULL') + ',' + CHAR(13) + CHAR(10) + '@BackupType = ''DIFF'',' + CHAR(13) + CHAR(10) + '@Verify = ''Y'',' + CHAR(13) + CHAR(10) + '@CleanupTime = ' + ISNULL(CAST(@CleanupTime AS nvarchar),'NULL') + ',' + CHAR(13) + CHAR(10) + '@CheckSum = ''Y'',' + CHAR(13) + CHAR(10) + '@LogToTable = ''' + @LogToTable + '''',
           @DatabaseName,
          'DatabaseBackup',
-         'DIFF'
+         'DIFF',
+         'Every hour after '+ @diff_time, 4, 1, 8, 1, 0, @diff_time + '00'
 
-  INSERT INTO @Jobs ([Name], CommandTSQL, DatabaseName, OutputFileNamePart01, OutputFileNamePart02)
+  INSERT INTO @Jobs ([Name], CommandTSQL, DatabaseName, OutputFileNamePart01, OutputFileNamePart02, schedule_name, schedule_freq_type, schedule_freq_interval, schedule_freq_subday_type, schedule_freq_subday_interval, schedule_freq_recurrence_factor, schedule_active_start_time)
   SELECT 'DatabaseBackup - USER_DATABASES - FULL',
          'EXECUTE [dbo].[DatabaseBackup]' + CHAR(13) + CHAR(10) + '@Databases = ''USER_DATABASES'',' + CHAR(13) + CHAR(10) + '@Directory = ' + ISNULL('N''' + REPLACE(@BackupDirectory,'''','''''') + '''','NULL') + ',' + CHAR(13) + CHAR(10) + '@BackupType = ''FULL'',' + CHAR(13) + CHAR(10) + '@Verify = ''Y'',' + CHAR(13) + CHAR(10) + '@CleanupTime = ' + ISNULL(CAST(@CleanupTime AS nvarchar),'NULL') + ',' + CHAR(13) + CHAR(10) + '@CheckSum = ''Y'',' + CHAR(13) + CHAR(10) + '@LogToTable = ''' + @LogToTable + '''',
          @DatabaseName,
          'DatabaseBackup',
-         'FULL'
+         'FULL',
+         'Every day at ' + @full_time, 4, 1, 1, 0, 0, @full_time + '00'
 
-  INSERT INTO @Jobs ([Name], CommandTSQL, DatabaseName, OutputFileNamePart01, OutputFileNamePart02)
+  INSERT INTO @Jobs ([Name], CommandTSQL, DatabaseName, OutputFileNamePart01, OutputFileNamePart02, schedule_name, schedule_freq_type, schedule_freq_interval, schedule_freq_subday_type, schedule_freq_subday_interval, schedule_freq_recurrence_factor, schedule_active_start_time)
   SELECT 'DatabaseBackup - USER_DATABASES - LOG',
          'EXECUTE [dbo].[DatabaseBackup]' + CHAR(13) + CHAR(10) + '@Databases = ''USER_DATABASES'',' + CHAR(13) + CHAR(10) + '@Directory = ' + ISNULL('N''' + REPLACE(@BackupDirectory,'''','''''') + '''','NULL') + ',' + CHAR(13) + CHAR(10) + '@BackupType = ''LOG'',' + CHAR(13) + CHAR(10) + '@Verify = ''Y'',' + CHAR(13) + CHAR(10) + '@CleanupTime = ' + ISNULL(CAST(@CleanupTime AS nvarchar),'NULL') + ',' + CHAR(13) + CHAR(10) + '@CheckSum = ''Y'',' + CHAR(13) + CHAR(10) + '@LogToTable = ''' + @LogToTable + '''',
          @DatabaseName,
          'DatabaseBackup',
-         'LOG'
+         'LOG',
+         'Every 10 minutes after ' + @log_time, 4, 1, 4, 10, 0, @log_time + '00'
 
-  INSERT INTO @Jobs ([Name], CommandTSQL, DatabaseName, OutputFileNamePart01)
+  INSERT INTO @Jobs ([Name], CommandTSQL, DatabaseName, OutputFileNamePart01, schedule_name, schedule_freq_type, schedule_freq_interval, schedule_freq_subday_type, schedule_freq_subday_interval, schedule_freq_recurrence_factor, schedule_active_start_time)
   SELECT 'DatabaseIntegrityCheck - SYSTEM_DATABASES',
          'EXECUTE [dbo].[DatabaseIntegrityCheck]' + CHAR(13) + CHAR(10) + '@Databases = ''SYSTEM_DATABASES'',' + CHAR(13) + CHAR(10) + '@LogToTable = ''' + @LogToTable + '''',
          @DatabaseName,
-         'DatabaseIntegrityCheck'
+         'DatabaseIntegrityCheck',
+         'Every day at ' + @check_time, 4, 1, 1, 0, 0, @check_time + '00'
 
-  INSERT INTO @Jobs ([Name], CommandTSQL, DatabaseName, OutputFileNamePart01)
+  INSERT INTO @Jobs ([Name], CommandTSQL, DatabaseName, OutputFileNamePart01, schedule_name, schedule_freq_type, schedule_freq_interval, schedule_freq_subday_type, schedule_freq_subday_interval, schedule_freq_recurrence_factor, schedule_active_start_time)
   SELECT 'DatabaseIntegrityCheck - USER_DATABASES',
          'EXECUTE [dbo].[DatabaseIntegrityCheck]' + CHAR(13) + CHAR(10) + '@Databases = ''USER_DATABASES' + CASE WHEN @AmazonRDS = 1 THEN ', -rdsadmin' ELSE '' END + ''',' + CHAR(13) + CHAR(10) + '@LogToTable = ''' + @LogToTable + '''',
          @DatabaseName,
-         'DatabaseIntegrityCheck'
+         'DatabaseIntegrityCheck',
+         'Every day at ' + @check_time, 4, 1, 1, 0, 0, @check_time + '00'
 
-  INSERT INTO @Jobs ([Name], CommandTSQL, DatabaseName, OutputFileNamePart01)
+  INSERT INTO @Jobs ([Name], CommandTSQL, DatabaseName, OutputFileNamePart01, schedule_name, schedule_freq_type, schedule_freq_interval, schedule_freq_subday_type, schedule_freq_subday_interval, schedule_freq_recurrence_factor, schedule_active_start_time)
   SELECT 'IndexOptimize - USER_DATABASES',
          'EXECUTE [dbo].[IndexOptimize]' + CHAR(13) + CHAR(10) + '@Databases = ''USER_DATABASES'',' + CHAR(13) + CHAR(10) + '@LogToTable = ''' + @LogToTable + '''',
          @DatabaseName,
-         'IndexOptimize'
+         'IndexOptimize',
+         'Every Saturday at ' + @index_time, 8, 64, 1, 0, 1, @index_time + '00'
 
-  INSERT INTO @Jobs ([Name], CommandTSQL, DatabaseName, OutputFileNamePart01)
+  INSERT INTO @Jobs ([Name], CommandTSQL, DatabaseName, OutputFileNamePart01, schedule_name, schedule_freq_type, schedule_freq_interval, schedule_freq_subday_type, schedule_freq_subday_interval, schedule_freq_recurrence_factor, schedule_active_start_time)
   SELECT 'sp_delete_backuphistory',
          'DECLARE @CleanupDate datetime' + CHAR(13) + CHAR(10) + 'SET @CleanupDate = DATEADD(dd,-30,GETDATE())' + CHAR(13) + CHAR(10) + 'EXECUTE dbo.sp_delete_backuphistory @oldest_date = @CleanupDate',
          'msdb',
-         'sp_delete_backuphistory'
+         'sp_delete_backuphistory',
+         'Every 1st of the month at ' + @cleanup_time, 16, 1, 1, 0, 1, @cleanup_time + '00'
 
-  INSERT INTO @Jobs ([Name], CommandTSQL, DatabaseName, OutputFileNamePart01)
+  INSERT INTO @Jobs ([Name], CommandTSQL, DatabaseName, OutputFileNamePart01, schedule_name, schedule_freq_type, schedule_freq_interval, schedule_freq_subday_type, schedule_freq_subday_interval, schedule_freq_recurrence_factor, schedule_active_start_time)
   SELECT 'sp_purge_jobhistory',
          'DECLARE @CleanupDate datetime' + CHAR(13) + CHAR(10) + 'SET @CleanupDate = DATEADD(dd,-30,GETDATE())' + CHAR(13) + CHAR(10) + 'EXECUTE dbo.sp_purge_jobhistory @oldest_date = @CleanupDate',
          'msdb',
-         'sp_purge_jobhistory'
+         'sp_purge_jobhistory',
+         'Every 2nd of the month at ' + @cleanup_time, 16, 2, 1, 0, 1, @cleanup_time + '00'
 
-  INSERT INTO @Jobs ([Name], CommandTSQL, DatabaseName, OutputFileNamePart01)
+  INSERT INTO @Jobs ([Name], CommandTSQL, DatabaseName, OutputFileNamePart01, schedule_name, schedule_freq_type, schedule_freq_interval, schedule_freq_subday_type, schedule_freq_subday_interval, schedule_freq_recurrence_factor, schedule_active_start_time)
   SELECT 'CommandLog Cleanup',
          'DELETE FROM [dbo].[CommandLog]' + CHAR(13) + CHAR(10) + 'WHERE StartTime < DATEADD(dd,-30,GETDATE())',
          @DatabaseName,
-         'CommandLogCleanup'
+         'CommandLogCleanup',
+         'Every 3rd of the month at ' + @cleanup_time, 16, 3, 1, 0, 1, @cleanup_time + '00'
 
-  INSERT INTO @Jobs ([Name], CommandCmdExec, OutputFileNamePart01)
+  INSERT INTO @Jobs ([Name], CommandCmdExec, OutputFileNamePart01, schedule_name, schedule_freq_type, schedule_freq_interval, schedule_freq_subday_type, schedule_freq_subday_interval, schedule_freq_recurrence_factor, schedule_active_start_time)
   SELECT 'Output File Cleanup',
          'cmd /q /c "For /F "tokens=1 delims=" %v In (''ForFiles /P "' + COALESCE(@OutputFileDirectory,@TokenLogDirectory,@LogDirectory) + '" /m *_*_*_*.txt /d -30 2^>^&1'') do if EXIST "' + COALESCE(@OutputFileDirectory,@TokenLogDirectory,@LogDirectory) + '"\%v echo del "' + COALESCE(@OutputFileDirectory,@TokenLogDirectory,@LogDirectory) + '"\%v& del "' + COALESCE(@OutputFileDirectory,@TokenLogDirectory,@LogDirectory) + '"\%v"',
-         'OutputFileCleanup'
+         'OutputFileCleanup',
+         'Every 4th of the month at ' + @cleanup_time, 16, 4, 1, 0, 1, @cleanup_time + '00'
 
   IF @AmazonRDS = 1
   BEGIN
@@ -8899,7 +8959,14 @@ BEGIN
            @CurrentCommandCmdExec = CommandCmdExec,
            @CurrentDatabaseName = DatabaseName,
            @CurrentOutputFileNamePart01 = OutputFileNamePart01,
-           @CurrentOutputFileNamePart02 = OutputFileNamePart02
+           @CurrentOutputFileNamePart02 = OutputFileNamePart02,
+           @current_schedule_name = schedule_name,
+           @current_schedule_freq_type = schedule_freq_type,
+           @current_schedule_freq_interval = schedule_freq_interval,
+           @current_schedule_freq_subday_type = schedule_freq_subday_type,
+           @current_schedule_freq_subday_interval = schedule_freq_subday_interval,
+           @current_schedule_freq_recurrence_factor = schedule_freq_recurrence_factor,
+           @current_schedule_active_start_time = schedule_active_start_time
     FROM @Jobs
     WHERE Completed = 0
     AND Selected = 1
@@ -8952,9 +9019,20 @@ BEGIN
 
     IF @CurrentJobStepSubSystem IS NOT NULL AND @CurrentJobStepCommand IS NOT NULL AND NOT EXISTS (SELECT * FROM msdb.dbo.sysjobs WHERE [name] = @CurrentJobName)
     BEGIN
-      EXECUTE msdb.dbo.sp_add_job @job_name = @CurrentJobName, @description = @JobDescription, @category_name = @JobCategory, @owner_login_name = @JobOwner
+      EXECUTE msdb.dbo.sp_add_job @job_name = @CurrentJobName, @description = @JobDescription, @category_name = @JobCategory, @owner_login_name = @JobOwner, @notify_level_eventlog = 2, @notify_level_email = 2, @notify_email_operator_name = @OperatorEmail
       EXECUTE msdb.dbo.sp_add_jobstep @job_name = @CurrentJobName, @step_name = @CurrentJobName, @subsystem = @CurrentJobStepSubSystem, @command = @CurrentJobStepCommand, @output_file_name = @CurrentOutputFileName, @database_name = @CurrentJobStepDatabaseName
       EXECUTE msdb.dbo.sp_add_jobserver @job_name = @CurrentJobName
+      IF (SELECT [Value] FROM #Config WHERE Name = 'CreateSchedules') = 'Y'
+      BEGIN
+        EXECUTE msdb.dbo.sp_add_jobschedule @job_name = @CurrentJobName,
+          @name = @current_schedule_name,
+          @freq_type = @current_schedule_freq_type,
+          @freq_interval = @current_schedule_freq_interval,
+          @freq_subday_type = @current_schedule_freq_subday_type,
+          @freq_subday_interval = @current_schedule_freq_subday_interval,
+          @freq_recurrence_factor = @current_schedule_freq_recurrence_factor,
+          @active_start_time = @current_schedule_active_start_time;
+      END
     END
 
     UPDATE Jobs
@@ -8973,6 +9051,14 @@ BEGIN
     SET @CurrentJobStepSubSystem = NULL
     SET @CurrentJobStepDatabaseName = NULL
     SET @CurrentOutputFileName = NULL
+
+    SET @current_schedule_name = NULL
+    SET @current_schedule_freq_type = NULL
+    SET @current_schedule_freq_interval = NULL
+    SET @current_schedule_freq_subday_type = NULL
+    SET @current_schedule_freq_subday_interval = NULL
+    SET @current_schedule_freq_recurrence_factor = NULL
+    SET @current_schedule_active_start_time = NULL
 
   END
 
